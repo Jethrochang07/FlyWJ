@@ -30,6 +30,7 @@ CB_BODY_ABS = "gym_body_abs"
 CB_EQ_DUMBBELL = "gym_eq_dumbbell"
 CB_EQ_BARBELL = "gym_eq_barbell"
 CB_EQ_MACHINE = "gym_eq_machine"
+CB_EQ_CABLE = "gym_eq_cable"
 CB_EQ_BODYWEIGHT = "gym_eq_bodyweight"
 
 CB_YES = "yn_yes"
@@ -67,6 +68,7 @@ def _gym_equipment_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Dumbbell", callback_data=CB_EQ_DUMBBELL)],
             [InlineKeyboardButton("Barbell", callback_data=CB_EQ_BARBELL)],
             [InlineKeyboardButton("Machine", callback_data=CB_EQ_MACHINE)],
+            [InlineKeyboardButton("Cable Machine", callback_data=CB_EQ_CABLE)],
             [InlineKeyboardButton("Body Weight", callback_data=CB_EQ_BODYWEIGHT)],
         ]
     )
@@ -272,6 +274,7 @@ async def on_gym_equipment_choice(update: Update, context: ContextTypes.DEFAULT_
         CB_EQ_DUMBBELL: "Dumbbell",
         CB_EQ_BARBELL: "Barbell",
         CB_EQ_MACHINE: "Machine",
+        CB_EQ_CABLE: "Cable",
         CB_EQ_BODYWEIGHT: "Body Weight",
     }
     equipment = eq_map.get(query.data)
