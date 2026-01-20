@@ -24,7 +24,7 @@ logging.basicConfig(
 # =========================
 # For testing: 5 minutes (300 seconds)
 # For production: 3 hours (10800 seconds)
-INACTIVITY_SECONDS = 300
+INACTIVITY_SECONDS = 10800
 ONBOARDING_ASK_NAME = "ask_name"
 
 DAY_CARDIO = "Post-gym cardio"
