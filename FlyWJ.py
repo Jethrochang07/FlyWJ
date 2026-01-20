@@ -36,6 +36,7 @@ CB_BODY_CHEST = "gym_body_chest"
 CB_BODY_BACK = "gym_body_back"
 CB_BODY_LEGS = "gym_body_legs"
 CB_BODY_ABS = "gym_body_abs"
+CB_BODY_CARDIO = "gym_body_cardio"  # NEW: Post-gym cardio
 
 CB_EQ_DUMBBELL = "gym_eq_dumbbell"
 CB_EQ_BARBELL = "gym_eq_barbell"
@@ -45,6 +46,10 @@ CB_EQ_BODYWEIGHT = "gym_eq_bodyweight"
 
 CB_GYM_CONTINUE = "gym_continue"
 CB_GYM_END = "gym_end"
+
+# NEW: post-end choices (after timer/manual end)
+CB_POST_CONTINUE = "post_continue"
+CB_POST_NEW_DAY = "post_new_day"
 
 
 # =========================
@@ -61,12 +66,14 @@ def _log_keyboard() -> InlineKeyboardMarkup:
 
 
 def _gym_bodypart_keyboard() -> InlineKeyboardMarkup:
+    # Added Post-gym cardio BELOW Abs
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Chest", callback_data=CB_BODY_CHEST)],
             [InlineKeyboardButton("Back", callback_data=CB_BODY_BACK)],
             [InlineKeyboardButton("Legs", callback_data=CB_BODY_LEGS)],
             [InlineKeyboardButton("Abs", callback_data=CB_BODY_ABS)],
+            [InlineKeyboardButton("Post-gym cardio", callback_data=CB_BODY_CARDIO)],
         ]
     )
 
@@ -94,6 +101,15 @@ def _continue_end_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _post_end_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("➕ Continue logging (same day)", callback_data=CB_POST_CONTINUE),
+            InlineKeyboardButton("🗓️ Start new day", callback_data=CB_POST_NEW_DAY),
+        ]]
+    )
+
+
 # =========================
 # Helpers / Formatting
 # =========================
@@ -112,6 +128,7 @@ def _ensure_gym_session(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _format_compact(sets: int, reps: list[int], weights: list[str]) -> str:
+    # 3 x 10(12.5), 8(15), 6(15)
     return f"{sets} x " + ", ".join(f"{reps[i]}({weights[i]})" for i in range(sets))
 
 
@@ -174,7 +191,7 @@ def _parse_set_input(text: str):
 # =========================
 # UNIVERSAL Inactivity Timer (per user)
 # Resets on ANY user interaction (message or button)
-# If nothing happens for INACTIVITY_SECONDS -> end workout + send summary
+# If nothing happens for INACTIVITY_SECONDS -> end session + send summary + show post-end options
 # =========================
 def _cancel_inactivity_timer(context: ContextTypes.DEFAULT_TYPE):
     task = context.user_data.get("inactivity_task")
@@ -188,9 +205,6 @@ def _touch_activity(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _reset_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """
-    Call this on ANY interaction.
-    """
     _touch_activity(context)
     _cancel_inactivity_timer(context)
 
@@ -202,31 +216,26 @@ def _reset_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             if time.time() - last < INACTIVITY_SECONDS:
                 return  # became active again
 
-            # Time to end the day/session
             sess = context.user_data.get("gym_session")
             if sess:
                 summary_md = _format_workout_summary_md(context.user_data)
-                # Clear gym + flow
-                for k in [
-                    "gym_session",
-                    "pending_log_activity",
-                    "gym_body_part",
-                    "gym_equipment",
-                    "gym_wizard",
-                ]:
+
+                # IMPORTANT: keep gym_session so user can "continue same day"
+                # Clear only flow keys so it doesn't get stuck mid-wizard
+                for k in ["pending_log_activity", "gym_body_part", "gym_equipment", "gym_wizard"]:
                     context.user_data.pop(k, None)
 
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text="⏱️ No activity for a while, so I ended your log automatically.\n\n" + summary_md,
                     parse_mode="Markdown",
+                    reply_markup=_post_end_keyboard(),
                 )
             else:
-                # If no gym session, still clear flow so it doesn't linger
                 _reset_flow(context)
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="⏱️ No activity for a while, so I ended your log automatically.",
+                    text="⏱️ No activity for a while, so I ended your log automatically.\n\nType /log to start again.",
                 )
 
             # cleanup timer keys
@@ -288,6 +297,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def end_workout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Manual end, but still offer Continue/New Day options
     _reset_inactivity_timer(context, update.effective_chat.id)
 
     if "gym_session" not in context.user_data:
@@ -295,9 +305,15 @@ async def end_workout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = _format_workout_summary_md(context.user_data)
-    context.user_data.pop("gym_session", None)
+
+    # Keep gym_session so they can continue same day if they want
     _reset_flow(context)
-    await update.message.reply_text(msg, parse_mode="Markdown")
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=_post_end_keyboard(),
+    )
 
 
 # =========================
@@ -341,6 +357,7 @@ async def on_gym_bodypart_choice(update: Update, context: ContextTypes.DEFAULT_T
         CB_BODY_BACK: "Back",
         CB_BODY_LEGS: "Legs",
         CB_BODY_ABS: "Abs",
+        CB_BODY_CARDIO: "Post-gym cardio",  # NEW
     }
     body = body_map.get(q.data)
     if not body:
@@ -398,6 +415,7 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
 
         context.user_data.pop("gym_wizard", None)
         context.user_data.pop("gym_equipment", None)
+        context.user_data["pending_log_activity"] = "Gym"
 
         await q.edit_message_text(
             f"Day: {day}\nWhich equipment will you be using for the next exercise?",
@@ -407,11 +425,57 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
 
     if q.data == CB_GYM_END:
         msg = _format_workout_summary_md(context.user_data)
-        context.user_data.pop("gym_session", None)
+
+        # Keep gym_session so "continue same day" is possible
         _reset_flow(context)
 
         await q.edit_message_text("✅ Workout ended.")
-        await q.message.reply_text(msg, parse_mode="Markdown")
+        await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=_post_end_keyboard())
+        return
+
+
+async def on_post_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    After an auto-end or manual end:
+      - Continue logging (same day)
+      - Start new day
+    """
+    q = update.callback_query
+    await q.answer()
+
+    _reset_inactivity_timer(context, q.message.chat_id)
+
+    if q.data == CB_POST_CONTINUE:
+        _ensure_gym_session(context)
+        context.user_data["pending_log_activity"] = "Gym"
+
+        day = context.user_data["gym_session"].get("day")
+        if not day:
+            await q.edit_message_text(
+                "Alright — what body part are you hitting today?",
+                reply_markup=_gym_bodypart_keyboard(),
+            )
+            return
+
+        await q.edit_message_text(
+            f"Continuing Day: {day}\nWhich equipment will you be using next?",
+            reply_markup=_gym_equipment_keyboard(),
+        )
+        return
+
+    if q.data == CB_POST_NEW_DAY:
+        # Full reset of the gym session
+        context.user_data.pop("gym_session", None)
+        _reset_flow(context)
+        _ensure_gym_session(context)
+
+        context.user_data["gym_session"]["date"] = datetime.now().strftime("%d-%m-%Y")
+        context.user_data["pending_log_activity"] = "Gym"
+
+        await q.edit_message_text(
+            "New day started ✅\nWhat body part are you hitting today?",
+            reply_markup=_gym_bodypart_keyboard(),
+        )
         return
 
 
@@ -543,6 +607,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_gym_bodypart_choice, pattern=r"^gym_body_"))
     app.add_handler(CallbackQueryHandler(on_gym_equipment_choice, pattern=r"^gym_eq_"))
     app.add_handler(CallbackQueryHandler(on_continue_end_choice, pattern=r"^gym_(continue|end)$"))
+    app.add_handler(CallbackQueryHandler(on_post_end_choice, pattern=r"^post_(continue|new_day)$"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_details_message))
 
