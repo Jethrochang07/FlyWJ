@@ -151,9 +151,6 @@ def _format_compact(sets: int, reps: list[int], weights: list[str]) -> str:
 
 
 def _format_cardio_entry_md(mode: str, degree: str | None, speed: str) -> str:
-    # Example:
-    # Incline 10° @ 6.5
-    # Flat @ 6.0
     if mode == "Incline":
         return f"Incline {degree}° @ {speed}"
     return f"Flat @ {speed}"
@@ -203,10 +200,6 @@ def _is_int(s: str) -> bool:
 
 
 def _parse_set_input(text: str):
-    """
-    Accept: '6@60', '6 @ 60', '6x60'
-    Returns: (reps:int, weight:str) or None
-    """
     t = text.strip().lower().replace(" ", "").replace("x", "@")
     if "@" not in t:
         return None
@@ -221,7 +214,6 @@ def _parse_set_input(text: str):
 
 
 def _is_number_like(s: str) -> bool:
-    # allow 6, 6.5, 12.5 etc
     try:
         float(s.strip())
         return True
@@ -239,6 +231,13 @@ def _cancel_inactivity_timer(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("inactivity_task", None)
 
 
+def _stop_inactivity_tracking(context: ContextTypes.DEFAULT_TYPE):
+    """Hard stop: prevents any future 'no activity' message from firing."""
+    _cancel_inactivity_timer(context)
+    context.user_data.pop("last_activity_ts", None)
+    context.user_data.pop("inactivity_task", None)
+
+
 def _touch_activity(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["last_activity_ts"] = time.time()
 
@@ -251,7 +250,12 @@ def _reset_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         try:
             await asyncio.sleep(INACTIVITY_SECONDS)
 
-            last = context.user_data.get("last_activity_ts", 0)
+            # If user ended workout manually, we remove last_activity_ts.
+            # That means this worker should NOT send anything.
+            last = context.user_data.get("last_activity_ts")
+            if last is None:
+                return
+
             if time.time() - last < INACTIVITY_SECONDS:
                 return
 
@@ -343,7 +347,8 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def end_workout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _reset_inactivity_timer(context, update.effective_chat.id)
+    # ✅ If user manually ends, stop timer so auto-end won't trigger later
+    _stop_inactivity_tracking(context)
 
     if "gym_session" not in context.user_data:
         await update.message.reply_text("No active gym workout.")
@@ -408,7 +413,6 @@ async def on_gym_bodypart_choice(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["gym_session"]["day"] = body
     context.user_data["pending_log_activity"] = "Gym"
 
-    # If cardio, go to cardio mode instead of equipment/exercise flow
     if body == DAY_CARDIO:
         context.user_data.pop("gym_equipment", None)
         context.user_data.pop("gym_wizard", None)
@@ -476,6 +480,7 @@ async def on_cardio_mode_choice(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         await q.edit_message_text("Flat selected.\nWhat speed? (e.g. `6.0`, `10`)")
 
+
 async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -487,7 +492,6 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["gym_body_part"] = day
         context.user_data["pending_log_activity"] = "Gym"
 
-        # cardio continue goes back to cardio mode
         if day == DAY_CARDIO:
             context.user_data.pop("cardio_wizard", None)
             context.user_data.pop("gym_wizard", None)
@@ -499,7 +503,6 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-        # lifting continue goes back to equipment
         context.user_data.pop("gym_wizard", None)
         context.user_data.pop("gym_equipment", None)
         context.user_data.pop("cardio_wizard", None)
@@ -511,6 +514,9 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if q.data == CB_GYM_END:
+        # ✅ user ended workout manually — stop timer so auto-end won't fire
+        _stop_inactivity_tracking(context)
+
         msg = _format_workout_summary_md(context.user_data)
         _reset_flow(context)
         await q.edit_message_text("✅ Workout ended.")
@@ -535,7 +541,6 @@ async def on_post_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        # cardio continue (same day)
         if day == DAY_CARDIO:
             context.user_data["cardio_wizard"] = {"step": "choose_mode"}
             await q.edit_message_text(
@@ -544,7 +549,6 @@ async def on_post_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        # lifting continue (same day)
         await q.edit_message_text(
             f"Continuing Day: {day}\nWhich equipment will you be using next?",
             reply_markup=_gym_equipment_keyboard(),
@@ -576,7 +580,6 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not text:
         return
 
-    # Onboarding
     if context.user_data.get("onboarding") == ONBOARDING_ASK_NAME:
         name = text.strip()
         if len(name) < 2:
@@ -589,13 +592,11 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     pending = context.user_data.get("pending_log_activity")
 
-    # ----- Gym flow -----
     if pending == "Gym":
         _ensure_gym_session(context)
         sess = context.user_data["gym_session"]
         day = sess.get("day")
 
-        # ----- Cardio flow -----
         if day == DAY_CARDIO:
             wiz = context.user_data.get("cardio_wizard")
             if not wiz:
@@ -636,7 +637,6 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     }
                 )
 
-                # clear cardio wizard for next action
                 context.user_data.pop("cardio_wizard", None)
 
                 await update.message.reply_text(
@@ -649,7 +649,6 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("I got confused in cardio flow. Type /log to restart.")
             return
 
-        # ----- Lifting flow -----
         equipment = context.user_data.get("gym_equipment")
         if not day or not equipment:
             await update.message.reply_text("Please choose Day + Equipment first. Type /log and pick Gym.")
@@ -721,7 +720,6 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("I got confused in the flow. Type /log to restart.")
         return
 
-    # ----- Run / Other quick log -----
     if pending in ("Run", "Other"):
         activity = pending
         context.user_data.pop("pending_log_activity", None)
