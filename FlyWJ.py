@@ -27,6 +27,8 @@ logging.basicConfig(
 INACTIVITY_SECONDS = 300
 ONBOARDING_ASK_NAME = "ask_name"
 
+DAY_CARDIO = "Post-gym cardio"
+
 # ---------- Callback data ----------
 CB_RUN = "log_run"
 CB_GYM = "log_gym"
@@ -36,7 +38,7 @@ CB_BODY_CHEST = "gym_body_chest"
 CB_BODY_BACK = "gym_body_back"
 CB_BODY_LEGS = "gym_body_legs"
 CB_BODY_ABS = "gym_body_abs"
-CB_BODY_CARDIO = "gym_body_cardio"  # NEW: Post-gym cardio
+CB_BODY_CARDIO = "gym_body_cardio"  # Post-gym cardio
 
 CB_EQ_DUMBBELL = "gym_eq_dumbbell"
 CB_EQ_BARBELL = "gym_eq_barbell"
@@ -47,9 +49,12 @@ CB_EQ_BODYWEIGHT = "gym_eq_bodyweight"
 CB_GYM_CONTINUE = "gym_continue"
 CB_GYM_END = "gym_end"
 
-# NEW: post-end choices (after timer/manual end)
 CB_POST_CONTINUE = "post_continue"
 CB_POST_NEW_DAY = "post_new_day"
+
+# Cardio mode choices
+CB_CARDIO_INCLINE = "cardio_incline"
+CB_CARDIO_FLAT = "cardio_flat"
 
 
 # =========================
@@ -66,7 +71,6 @@ def _log_keyboard() -> InlineKeyboardMarkup:
 
 
 def _gym_bodypart_keyboard() -> InlineKeyboardMarkup:
-    # Added Post-gym cardio BELOW Abs
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Chest", callback_data=CB_BODY_CHEST)],
@@ -110,11 +114,26 @@ def _post_end_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _cardio_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("⬆️ Incline", callback_data=CB_CARDIO_INCLINE),
+            InlineKeyboardButton("➡️ Flat", callback_data=CB_CARDIO_FLAT),
+        ]]
+    )
+
+
 # =========================
 # Helpers / Formatting
 # =========================
 def _reset_flow(context: ContextTypes.DEFAULT_TYPE):
-    for k in ["pending_log_activity", "gym_body_part", "gym_equipment", "gym_wizard"]:
+    for k in [
+        "pending_log_activity",
+        "gym_body_part",
+        "gym_equipment",
+        "gym_wizard",
+        "cardio_wizard",
+    ]:
         context.user_data.pop(k, None)
 
 
@@ -128,8 +147,16 @@ def _ensure_gym_session(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _format_compact(sets: int, reps: list[int], weights: list[str]) -> str:
-    # 3 x 10(12.5), 8(15), 6(15)
     return f"{sets} x " + ", ".join(f"{reps[i]}({weights[i]})" for i in range(sets))
+
+
+def _format_cardio_entry_md(mode: str, degree: str | None, speed: str) -> str:
+    # Example:
+    # Incline 10° @ 6.5
+    # Flat @ 6.0
+    if mode == "Incline":
+        return f"Incline {degree}° @ {speed}"
+    return f"Flat @ {speed}"
 
 
 def _format_workout_summary_md(user_data: dict) -> str:
@@ -142,12 +169,17 @@ def _format_workout_summary_md(user_data: dict) -> str:
 
     lines = [f"Summary of *{date}* Workout", f"Day: {day}"]
 
-    if not sess.get("entries"):
+    entries = sess.get("entries") or []
+    if not entries:
         lines.append("(no exercises logged)")
         return "\n".join(lines)
 
-    for e in sess["entries"]:
-        lines.append(f"{e['equipment']} {e['exercise']} — {e['compact']}")
+    for e in entries:
+        kind = e.get("kind", "lift")
+        if kind == "cardio":
+            lines.append(f"Cardio — {e['text']}")
+        else:
+            lines.append(f"{e['equipment']} {e['exercise']} — {e['compact']}")
 
     return "\n".join(lines)
 
@@ -188,10 +220,17 @@ def _parse_set_input(text: str):
     return reps, weight
 
 
+def _is_number_like(s: str) -> bool:
+    # allow 6, 6.5, 12.5 etc
+    try:
+        float(s.strip())
+        return True
+    except Exception:
+        return False
+
+
 # =========================
 # UNIVERSAL Inactivity Timer (per user)
-# Resets on ANY user interaction (message or button)
-# If nothing happens for INACTIVITY_SECONDS -> end session + send summary + show post-end options
 # =========================
 def _cancel_inactivity_timer(context: ContextTypes.DEFAULT_TYPE):
     task = context.user_data.get("inactivity_task")
@@ -214,15 +253,14 @@ def _reset_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
             last = context.user_data.get("last_activity_ts", 0)
             if time.time() - last < INACTIVITY_SECONDS:
-                return  # became active again
+                return
 
             sess = context.user_data.get("gym_session")
             if sess:
                 summary_md = _format_workout_summary_md(context.user_data)
 
-                # IMPORTANT: keep gym_session so user can "continue same day"
-                # Clear only flow keys so it doesn't get stuck mid-wizard
-                for k in ["pending_log_activity", "gym_body_part", "gym_equipment", "gym_wizard"]:
+                # clear flow keys but keep session so user can continue same day
+                for k in ["pending_log_activity", "gym_body_part", "gym_equipment", "gym_wizard", "cardio_wizard"]:
                     context.user_data.pop(k, None)
 
                 await context.bot.send_message(
@@ -238,7 +276,6 @@ def _reset_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                     text="⏱️ No activity for a while, so I ended your log automatically.\n\nType /log to start again.",
                 )
 
-            # cleanup timer keys
             context.user_data.pop("last_activity_ts", None)
             context.user_data.pop("inactivity_task", None)
 
@@ -260,7 +297,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👋 Hey there!\n\nWhat should I call you?")
         return
 
-    await update.message.reply_text(f"Welcome back, {name} 💪\n\nType /log to log an activity.")
+    await update.message.reply_text(
+        f"Welcome back, {name} 💪\n\n"
+        "Commands:\n"
+        "/log — log an activity\n"
+        "/summary — view recent logs\n"
+    )
 
 
 async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,7 +322,11 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sess and sess.get("entries"):
         lines.append(f"🏋️ Gym ({sess.get('date')}): Day: {sess.get('day') or 'Unknown'}")
         for i, e in enumerate(sess["entries"][-10:], start=1):
-            lines.append(f"{i}. {e['equipment']} {e['exercise']} — {e['compact']}")
+            kind = e.get("kind", "lift")
+            if kind == "cardio":
+                lines.append(f"{i}. Cardio — {e['text']}")
+            else:
+                lines.append(f"{i}. {e['equipment']} {e['exercise']} — {e['compact']}")
         lines.append("")
 
     logs = context.user_data.get("logs", [])
@@ -297,7 +343,6 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def end_workout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Manual end, but still offer Continue/New Day options
     _reset_inactivity_timer(context, update.effective_chat.id)
 
     if "gym_session" not in context.user_data:
@@ -306,14 +351,10 @@ async def end_workout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = _format_workout_summary_md(context.user_data)
 
-    # Keep gym_session so they can continue same day if they want
+    # keep gym_session so they can continue same day if they want
     _reset_flow(context)
 
-    await update.message.reply_text(
-        msg,
-        parse_mode="Markdown",
-        reply_markup=_post_end_keyboard(),
-    )
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=_post_end_keyboard())
 
 
 # =========================
@@ -322,7 +363,6 @@ async def end_workout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_log_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     _reset_inactivity_timer(context, q.message.chat_id)
 
     if q.data == CB_GYM:
@@ -349,7 +389,6 @@ async def on_log_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_gym_bodypart_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     _reset_inactivity_timer(context, q.message.chat_id)
 
     body_map = {
@@ -357,7 +396,7 @@ async def on_gym_bodypart_choice(update: Update, context: ContextTypes.DEFAULT_T
         CB_BODY_BACK: "Back",
         CB_BODY_LEGS: "Legs",
         CB_BODY_ABS: "Abs",
-        CB_BODY_CARDIO: "Post-gym cardio",  # NEW
+        CB_BODY_CARDIO: DAY_CARDIO,
     }
     body = body_map.get(q.data)
     if not body:
@@ -367,6 +406,18 @@ async def on_gym_bodypart_choice(update: Update, context: ContextTypes.DEFAULT_T
     _ensure_gym_session(context)
     context.user_data["gym_body_part"] = body
     context.user_data["gym_session"]["day"] = body
+    context.user_data["pending_log_activity"] = "Gym"
+
+    # If cardio, go to cardio mode instead of equipment/exercise flow
+    if body == DAY_CARDIO:
+        context.user_data.pop("gym_equipment", None)
+        context.user_data.pop("gym_wizard", None)
+        context.user_data["cardio_wizard"] = {"step": "choose_mode"}
+        await q.edit_message_text(
+            "🏃 Post-gym cardio selected.\nIs it Incline or Flat?",
+            reply_markup=_cardio_mode_keyboard(),
+        )
+        return
 
     await q.edit_message_text(
         f"Day selected: {body}\nWhich equipment will you be using?",
@@ -377,7 +428,6 @@ async def on_gym_bodypart_choice(update: Update, context: ContextTypes.DEFAULT_T
 async def on_gym_equipment_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     _reset_inactivity_timer(context, q.message.chat_id)
 
     eq_map = {
@@ -402,20 +452,57 @@ async def on_gym_equipment_choice(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+async def on_cardio_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _reset_inactivity_timer(context, q.message.chat_id)
+
+    _ensure_gym_session(context)
+    sess = context.user_data["gym_session"]
+    if sess.get("day") != DAY_CARDIO:
+        await q.edit_message_text("Cardio mode is only for Post-gym cardio. Type /log to start.")
+        return
+
+    mode = "Incline" if q.data == CB_CARDIO_INCLINE else "Flat"
+    context.user_data["cardio_wizard"] = {
+        "step": "ask_degree" if mode == "Incline" else "ask_speed",
+        "mode": mode,
+        "degree": None,
+        "speed": None,
+    }
+
+    if mode == "Incline":
+        await q.edit_message_text("Incline degree? (e.g. `10`)  \nType a number only.", parse_mode="Markdown")
+    else:
+        await q.edit_message_text("Flat selected.\nWhat speed? (e.g. `6.0`, `10`)")
+
 async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     _reset_inactivity_timer(context, q.message.chat_id)
 
     if q.data == CB_GYM_CONTINUE:
         sess = context.user_data.get("gym_session", {})
         day = sess.get("day") or context.user_data.get("gym_body_part") or "Unknown"
         context.user_data["gym_body_part"] = day
+        context.user_data["pending_log_activity"] = "Gym"
 
+        # cardio continue goes back to cardio mode
+        if day == DAY_CARDIO:
+            context.user_data.pop("cardio_wizard", None)
+            context.user_data.pop("gym_wizard", None)
+            context.user_data.pop("gym_equipment", None)
+            context.user_data["cardio_wizard"] = {"step": "choose_mode"}
+            await q.edit_message_text(
+                "Continuing Post-gym cardio.\nIncline or Flat?",
+                reply_markup=_cardio_mode_keyboard(),
+            )
+            return
+
+        # lifting continue goes back to equipment
         context.user_data.pop("gym_wizard", None)
         context.user_data.pop("gym_equipment", None)
-        context.user_data["pending_log_activity"] = "Gym"
+        context.user_data.pop("cardio_wizard", None)
 
         await q.edit_message_text(
             f"Day: {day}\nWhich equipment will you be using for the next exercise?",
@@ -425,24 +512,15 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
 
     if q.data == CB_GYM_END:
         msg = _format_workout_summary_md(context.user_data)
-
-        # Keep gym_session so "continue same day" is possible
         _reset_flow(context)
-
         await q.edit_message_text("✅ Workout ended.")
         await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=_post_end_keyboard())
         return
 
 
 async def on_post_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    After an auto-end or manual end:
-      - Continue logging (same day)
-      - Start new day
-    """
     q = update.callback_query
     await q.answer()
-
     _reset_inactivity_timer(context, q.message.chat_id)
 
     if q.data == CB_POST_CONTINUE:
@@ -457,6 +535,16 @@ async def on_post_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
+        # cardio continue (same day)
+        if day == DAY_CARDIO:
+            context.user_data["cardio_wizard"] = {"step": "choose_mode"}
+            await q.edit_message_text(
+                "Continuing Post-gym cardio.\nIncline or Flat?",
+                reply_markup=_cardio_mode_keyboard(),
+            )
+            return
+
+        # lifting continue (same day)
         await q.edit_message_text(
             f"Continuing Day: {day}\nWhich equipment will you be using next?",
             reply_markup=_gym_equipment_keyboard(),
@@ -464,7 +552,6 @@ async def on_post_end_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if q.data == CB_POST_NEW_DAY:
-        # Full reset of the gym session
         context.user_data.pop("gym_session", None)
         _reset_flow(context)
         _ensure_gym_session(context)
@@ -502,12 +589,67 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     pending = context.user_data.get("pending_log_activity")
 
-    # Gym flow (set-by-set)
+    # ----- Gym flow -----
     if pending == "Gym":
         _ensure_gym_session(context)
         sess = context.user_data["gym_session"]
-
         day = sess.get("day")
+
+        # ----- Cardio flow -----
+        if day == DAY_CARDIO:
+            wiz = context.user_data.get("cardio_wizard")
+            if not wiz:
+                await update.message.reply_text("Tap /log → Gym → Post-gym cardio to start cardio logging.")
+                return
+
+            step = wiz.get("step")
+            mode = wiz.get("mode")
+
+            if step == "choose_mode":
+                await update.message.reply_text("Please choose Incline or Flat using the buttons.")
+                return
+
+            if step == "ask_degree":
+                if not _is_number_like(text):
+                    await update.message.reply_text("Please enter a number for incline degree (e.g. `10`).", parse_mode="Markdown")
+                    return
+                wiz["degree"] = text.strip()
+                wiz["step"] = "ask_speed"
+                await update.message.reply_text("What speed? (e.g. `6.0`, `10`)")
+                return
+
+            if step == "ask_speed":
+                if not _is_number_like(text):
+                    await update.message.reply_text("Please enter a number for speed (e.g. `6.0`).", parse_mode="Markdown")
+                    return
+                wiz["speed"] = text.strip()
+
+                entry_text = _format_cardio_entry_md(mode, wiz.get("degree"), wiz["speed"])
+
+                sess["entries"].append(
+                    {
+                        "kind": "cardio",
+                        "text": entry_text,
+                        "mode": mode,
+                        "degree": wiz.get("degree"),
+                        "speed": wiz["speed"],
+                    }
+                )
+
+                # clear cardio wizard for next action
+                context.user_data.pop("cardio_wizard", None)
+
+                await update.message.reply_text(
+                    f"Day: {DAY_CARDIO}\nCardio — {entry_text}\n\n"
+                    "Would you like to continue logging or end the workout?",
+                    reply_markup=_continue_end_keyboard(),
+                )
+                return
+
+            await update.message.reply_text("I got confused in cardio flow. Type /log to restart.")
+            return
+
+        # ----- Lifting flow -----
         equipment = context.user_data.get("gym_equipment")
         if not day or not equipment:
             await update.message.reply_text("Please choose Day + Equipment first. Type /log and pick Gym.")
@@ -555,11 +697,13 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             sets = wiz["sets"]
             compact = _format_compact(sets, wiz["reps"], wiz["weights"])
+            exercise = wiz["exercise"]
 
             sess["entries"].append(
                 {
+                    "kind": "lift",
                     "equipment": equipment,
-                    "exercise": wiz["exercise"],
+                    "exercise": exercise,
                     "compact": compact,
                 }
             )
@@ -567,9 +711,8 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data.pop("gym_wizard", None)
             context.user_data.pop("gym_equipment", None)
 
-            day = sess.get("day") or "Unknown"
             await update.message.reply_text(
-                f"Day: {day}\n{equipment} {sess['entries'][-1]['exercise']}\n{compact}\n\n"
+                f"Day: {day}\n{equipment} {exercise}\n{compact}\n\n"
                 "Would you like to continue logging or end the workout?",
                 reply_markup=_continue_end_keyboard(),
             )
@@ -578,13 +721,14 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("I got confused in the flow. Type /log to restart.")
         return
 
-    # Run / Other quick log
+    # ----- Run / Other quick log -----
     if pending in ("Run", "Other"):
+        activity = pending
         context.user_data.pop("pending_log_activity", None)
         logs = context.user_data.setdefault("logs", [])
-        logs.append({"activity": pending, "details": text, "ts": datetime.now().isoformat(timespec="seconds")})
+        logs.append({"activity": activity, "details": text, "ts": datetime.now().isoformat(timespec="seconds")})
         await update.message.reply_text(
-            f"📌 Logged: {pending} — {text}\nType /log to add another, or /summary to see logs."
+            f"📌 Logged: {activity} — {text}\nType /log to add another, or /summary to see logs."
         )
 
 
@@ -606,6 +750,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_log_choice, pattern=r"^log_(run|gym|other)$"))
     app.add_handler(CallbackQueryHandler(on_gym_bodypart_choice, pattern=r"^gym_body_"))
     app.add_handler(CallbackQueryHandler(on_gym_equipment_choice, pattern=r"^gym_eq_"))
+    app.add_handler(CallbackQueryHandler(on_cardio_mode_choice, pattern=r"^cardio_(incline|flat)$"))
     app.add_handler(CallbackQueryHandler(on_continue_end_choice, pattern=r"^gym_(continue|end)$"))
     app.add_handler(CallbackQueryHandler(on_post_end_choice, pattern=r"^post_(continue|new_day)$"))
 
