@@ -1,5 +1,7 @@
 import os
 import logging
+import asyncio
+import time
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -20,10 +22,9 @@ logging.basicConfig(
 # =========================
 # CONFIG
 # =========================
-# For testing: 5 minutes = 300 seconds
-# For production: 3 hours = 10800 seconds
+# For testing: 5 minutes (300 seconds)
+# For production: 3 hours (10800 seconds)
 INACTIVITY_SECONDS = 300
-
 ONBOARDING_ASK_NAME = "ask_name"
 
 # ---------- Callback data ----------
@@ -94,7 +95,7 @@ def _continue_end_keyboard() -> InlineKeyboardMarkup:
 
 
 # =========================
-# Helpers
+# Helpers / Formatting
 # =========================
 def _reset_flow(context: ContextTypes.DEFAULT_TYPE):
     for k in ["pending_log_activity", "gym_body_part", "gym_equipment", "gym_wizard"]:
@@ -106,12 +107,11 @@ def _ensure_gym_session(context: ContextTypes.DEFAULT_TYPE):
         context.user_data["gym_session"] = {
             "date": datetime.now().strftime("%d-%m-%Y"),
             "day": None,
-            "entries": [],  # dicts: equipment, exercise, compact
+            "entries": [],
         }
 
 
 def _format_compact(sets: int, reps: list[int], weights: list[str]) -> str:
-    # 3 x 6(60), 4(61.25), 3(62.5)
     return f"{sets} x " + ", ".join(f"{reps[i]}({weights[i]})" for i in range(sets))
 
 
@@ -136,7 +136,6 @@ def _format_workout_summary_md(user_data: dict) -> str:
 
 
 def _wizard_init(exercise: str) -> dict:
-    # Option 1: set-by-set input
     return {
         "step": "ask_sets",
         "exercise": exercise.strip(),
@@ -156,7 +155,7 @@ def _is_int(s: str) -> bool:
 
 def _parse_set_input(text: str):
     """
-    Accept: '6@60', '6 @ 60', '6x60' (x treated as @)
+    Accept: '6@60', '6 @ 60', '6x60'
     Returns: (reps:int, weight:str) or None
     """
     t = text.strip().lower().replace(" ", "").replace("x", "@")
@@ -173,68 +172,79 @@ def _parse_set_input(text: str):
 
 
 # =========================
-# Inactivity Timer (JobQueue)
+# UNIVERSAL Inactivity Timer (per user)
+# Resets on ANY user interaction (message or button)
+# If nothing happens for INACTIVITY_SECONDS -> end workout + send summary
 # =========================
-def _cancel_gym_timeout(context: ContextTypes.DEFAULT_TYPE):
-    job = context.user_data.get("gym_timeout_job")
-    if job:
+def _cancel_inactivity_timer(context: ContextTypes.DEFAULT_TYPE):
+    task = context.user_data.get("inactivity_task")
+    if task and not task.done():
+        task.cancel()
+    context.user_data.pop("inactivity_task", None)
+
+
+def _touch_activity(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["last_activity_ts"] = time.time()
+
+
+def _reset_inactivity_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """
+    Call this on ANY interaction.
+    """
+    _touch_activity(context)
+    _cancel_inactivity_timer(context)
+
+    async def _worker():
         try:
-            job.schedule_removal()
-        except Exception:
-            pass
-        context.user_data.pop("gym_timeout_job", None)
+            await asyncio.sleep(INACTIVITY_SECONDS)
 
+            last = context.user_data.get("last_activity_ts", 0)
+            if time.time() - last < INACTIVITY_SECONDS:
+                return  # became active again
 
-def _reset_gym_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    """
-    Call this whenever the user does something in the Gym flow.
-    Resets the inactivity timer.
-    """
-    _cancel_gym_timeout(context)
+            # Time to end the day/session
+            sess = context.user_data.get("gym_session")
+            if sess:
+                summary_md = _format_workout_summary_md(context.user_data)
+                # Clear gym + flow
+                for k in [
+                    "gym_session",
+                    "pending_log_activity",
+                    "gym_body_part",
+                    "gym_equipment",
+                    "gym_wizard",
+                ]:
+                    context.user_data.pop(k, None)
 
-    job = context.application.job_queue.run_once(
-        _on_gym_timeout,
-        when=INACTIVITY_SECONDS,
-        data={"chat_id": chat_id, "user_id": user_id},
-        name=f"gym_timeout_{chat_id}_{user_id}",
-    )
-    context.user_data["gym_timeout_job"] = job
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⏱️ No activity for a while, so I ended your log automatically.\n\n" + summary_md,
+                    parse_mode="Markdown",
+                )
+            else:
+                # If no gym session, still clear flow so it doesn't linger
+                _reset_flow(context)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⏱️ No activity for a while, so I ended your log automatically.",
+                )
 
+            # cleanup timer keys
+            context.user_data.pop("last_activity_ts", None)
+            context.user_data.pop("inactivity_task", None)
 
-async def _on_gym_timeout(context: ContextTypes.DEFAULT_TYPE):
-    """
-    JobQueue callback after inactivity.
-    Auto-ends workout if there's an active gym_session.
-    """
-    data = context.job.data or {}
-    chat_id = data.get("chat_id")
-    user_id = data.get("user_id")
+        except asyncio.CancelledError:
+            return
 
-    if chat_id is None or user_id is None:
-        return
-
-    user_data = context.application.user_data.get(user_id, {})
-    sess = user_data.get("gym_session")
-    if not sess:
-        return  # no active gym workout
-
-    summary_md = _format_workout_summary_md(user_data)
-
-    # Clear gym state
-    for k in ["gym_session", "pending_log_activity", "gym_body_part", "gym_equipment", "gym_wizard", "gym_timeout_job"]:
-        user_data.pop(k, None)
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="⏱️ No activity detected for a while, so I ended your workout automatically.\n\n" + summary_md,
-        parse_mode="Markdown",
-    )
+    context.user_data["inactivity_task"] = asyncio.create_task(_worker())
 
 
 # =========================
 # Commands
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _reset_inactivity_timer(context, update.effective_chat.id)
+
     name = context.user_data.get("name")
     if not name:
         context.user_data["onboarding"] = ONBOARDING_ASK_NAME
@@ -245,6 +255,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _reset_inactivity_timer(context, update.effective_chat.id)
+
     name = context.user_data.get("name", "")
     greeting = f"{name}, what would you like to log?" if name else "What would you like to log?"
     _reset_flow(context)
@@ -252,8 +264,9 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = []
+    _reset_inactivity_timer(context, update.effective_chat.id)
 
+    lines = []
     sess = context.user_data.get("gym_session")
     if sess and sess.get("entries"):
         lines.append(f"🏋️ Gym ({sess.get('date')}): Day: {sess.get('day') or 'Unknown'}")
@@ -275,17 +288,15 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def end_workout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Manual end (also cancels timer)
+    _reset_inactivity_timer(context, update.effective_chat.id)
+
     if "gym_session" not in context.user_data:
         await update.message.reply_text("No active gym workout.")
         return
 
-    _cancel_gym_timeout(context)
     msg = _format_workout_summary_md(context.user_data)
-
     context.user_data.pop("gym_session", None)
     _reset_flow(context)
-
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -296,23 +307,17 @@ async def on_log_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    chat_id = q.message.chat_id
-    user_id = q.from_user.id
+    _reset_inactivity_timer(context, q.message.chat_id)
 
     if q.data == CB_GYM:
         _ensure_gym_session(context)
         context.user_data["pending_log_activity"] = "Gym"
-
-        # Start/reset timer when gym flow begins
-        _reset_gym_timeout(context, chat_id, user_id)
-
         await q.edit_message_text(
             "🏋️ Gym selected.\nWhat body part are you hitting today?",
             reply_markup=_gym_bodypart_keyboard(),
         )
         return
 
-    # Run / Other: simple text logging
     activity = {CB_RUN: "Run", CB_OTHER: "Other"}.get(q.data)
     if not activity:
         await q.edit_message_text("Unknown option. Please type /log again.")
@@ -329,9 +334,7 @@ async def on_gym_bodypart_choice(update: Update, context: ContextTypes.DEFAULT_T
     q = update.callback_query
     await q.answer()
 
-    chat_id = q.message.chat_id
-    user_id = q.from_user.id
-    _reset_gym_timeout(context, chat_id, user_id)
+    _reset_inactivity_timer(context, q.message.chat_id)
 
     body_map = {
         CB_BODY_CHEST: "Chest",
@@ -358,9 +361,7 @@ async def on_gym_equipment_choice(update: Update, context: ContextTypes.DEFAULT_
     q = update.callback_query
     await q.answer()
 
-    chat_id = q.message.chat_id
-    user_id = q.from_user.id
-    _reset_gym_timeout(context, chat_id, user_id)
+    _reset_inactivity_timer(context, q.message.chat_id)
 
     eq_map = {
         CB_EQ_DUMBBELL: "Dumbbell",
@@ -388,18 +389,13 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
     q = update.callback_query
     await q.answer()
 
-    chat_id = q.message.chat_id
-    user_id = q.from_user.id
+    _reset_inactivity_timer(context, q.message.chat_id)
 
     if q.data == CB_GYM_CONTINUE:
-        # reset timer when continuing
-        _reset_gym_timeout(context, chat_id, user_id)
-
         sess = context.user_data.get("gym_session", {})
         day = sess.get("day") or context.user_data.get("gym_body_part") or "Unknown"
         context.user_data["gym_body_part"] = day
 
-        # clear per-exercise wizard + equipment so user chooses again
         context.user_data.pop("gym_wizard", None)
         context.user_data.pop("gym_equipment", None)
 
@@ -410,8 +406,6 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if q.data == CB_GYM_END:
-        _cancel_gym_timeout(context)
-
         msg = _format_workout_summary_md(context.user_data)
         context.user_data.pop("gym_session", None)
         _reset_flow(context)
@@ -425,17 +419,18 @@ async def on_continue_end_choice(update: Update, context: ContextTypes.DEFAULT_T
 # Text handler
 # =========================
 async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _reset_inactivity_timer(context, update.effective_chat.id)
+
     text = (update.message.text or "").strip()
     if not text:
         return
 
-    # Onboarding: ask for name
+    # Onboarding
     if context.user_data.get("onboarding") == ONBOARDING_ASK_NAME:
         name = text.strip()
         if len(name) < 2:
             await update.message.reply_text("That name seems a bit short 😅 Try again?")
             return
-
         context.user_data["name"] = name
         context.user_data.pop("onboarding", None)
         await update.message.reply_text(f"Nice to meet you, {name} 💪\n\nType /log when you're ready.")
@@ -446,14 +441,13 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Gym flow (set-by-set)
     if pending == "Gym":
         _ensure_gym_session(context)
-
         sess = context.user_data["gym_session"]
-        if not sess.get("day") or not context.user_data.get("gym_equipment"):
+
+        day = sess.get("day")
+        equipment = context.user_data.get("gym_equipment")
+        if not day or not equipment:
             await update.message.reply_text("Please choose Day + Equipment first. Type /log and pick Gym.")
             return
-
-        # Reset inactivity timer on any gym message
-        _reset_gym_timeout(context, update.effective_chat.id, update.effective_user.id)
 
         wiz = context.user_data.get("gym_wizard")
         if not wiz:
@@ -462,13 +456,11 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         step = wiz.get("step")
 
-        # Exercise name
         if step == "ask_exercise_name":
             context.user_data["gym_wizard"] = _wizard_init(text)
             await update.message.reply_text("Number of sets?")
             return
 
-        # Sets
         if step == "ask_sets":
             if not _is_int(text) or int(text) <= 0 or int(text) > 20:
                 await update.message.reply_text("Please enter a valid number of sets (1-20).")
@@ -482,7 +474,6 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        # Set lines
         if step == "ask_set_line":
             parsed = _parse_set_input(text)
             if not parsed:
@@ -498,25 +489,23 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await update.message.reply_text(f"Set {nxt} — reps @ weight?")
                 return
 
-            # Finalize exercise
             sets = wiz["sets"]
             compact = _format_compact(sets, wiz["reps"], wiz["weights"])
 
             sess["entries"].append(
                 {
-                    "equipment": context.user_data["gym_equipment"],
+                    "equipment": equipment,
                     "exercise": wiz["exercise"],
                     "compact": compact,
                 }
             )
 
-            # clear wizard + equipment so next exercise chooses equipment again (as you had)
             context.user_data.pop("gym_wizard", None)
             context.user_data.pop("gym_equipment", None)
 
             day = sess.get("day") or "Unknown"
             await update.message.reply_text(
-                f"Day: {day}\n{sess['entries'][-1]['equipment']} {sess['entries'][-1]['exercise']}\n{compact}\n\n"
+                f"Day: {day}\n{equipment} {sess['entries'][-1]['exercise']}\n{compact}\n\n"
                 "Would you like to continue logging or end the workout?",
                 reply_markup=_continue_end_keyboard(),
             )
@@ -530,7 +519,9 @@ async def on_details_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("pending_log_activity", None)
         logs = context.user_data.setdefault("logs", [])
         logs.append({"activity": pending, "details": text, "ts": datetime.now().isoformat(timespec="seconds")})
-        await update.message.reply_text(f"📌 Logged: {pending} — {text}\nType /log to add another, or /summary to see logs.")
+        await update.message.reply_text(
+            f"📌 Logged: {pending} — {text}\nType /log to add another, or /summary to see logs."
+        )
 
 
 # =========================
